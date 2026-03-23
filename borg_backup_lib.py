@@ -14,10 +14,18 @@ import urllib.request
 import urllib.error
 import socket
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, MISSING
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
+
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        tomllib = None
 
 
 @dataclass
@@ -29,28 +37,118 @@ class ManifestItem:
     appid: str
 
 
+def _load_toml_file(path: str) -> Dict[str, Any]:
+    if not tomllib:
+        return {}
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except Exception:
+        return {}
+
+
+_ENV_CONVERTERS = {
+    "api_timeout": int,
+    "verify_ssl": lambda v: v.lower() in ("1", "true", "yes", "on"),
+    "dry_run": lambda v: v.lower() in ("1", "true", "yes", "on"),
+    "api_retries": int,
+    "retry_backoff_sec": float,
+    "loop_interval_sec": int,
+}
+
+
 @dataclass
 class BackupConfig:
-    work_dir: str = os.environ.get("WORK_DIR", "/mnt/z/depots")
-    manifest_api_url: str = os.environ.get(
-        "MANIFEST_API_URL",
-        "https://n8n-tcloud-gz-4c8g.sliots.com/webhook/steamdb_manifest",
-    )
-    api_timeout: int = int(os.environ.get("API_TIMEOUT", "15"))
-    verify_ssl: bool = os.environ.get("VERIFY_SSL", "1") in ("1", "true", "True")
-    user_agent: str = os.environ.get("USER_AGENT", "steam-borg-backup/1.0")
-    depot_downloader_cmd: str = os.environ.get("DEPOT_DOWNLOADER_CMD", "DepotDownloader")
-    depot_downloader_extra_args: List[str] = None
-    borg_cmd: str = os.environ.get("BORG_CMD", "borg")
-    steam_username: str = os.environ.get("STEAM_USERNAME", "sliots")
-    steam_password: Optional[str] = os.environ.get("STEAM_PASSWORD")
-    dry_run: bool = os.environ.get("DRY_RUN", "0") in ("1", "true", "True")
-    api_retries: int = int(os.environ.get("API_RETRIES", "3"))
-    retry_backoff_sec: float = float(os.environ.get("RETRY_BACKOFF", "2.0"))
+    work_dir: str = "/mnt/z/depots/data"
+    manifest_api_url: str = ""
+    list_api_url: str = ""
+    api_timeout: int = 15
+    verify_ssl: bool = True
+    user_agent: str = "steam-borg-backup/1.0"
+    depot_downloader_cmd: str = "DepotDownloader"
+    depot_downloader_extra_args: Optional[List[str]] = None
+    borg_cmd: str = "borg"
+    steam_username: str = ""
+    steam_password: Optional[str] = None
+    dry_run: bool = False
+    api_retries: int = 3
+    retry_backoff_sec: float = 2.0
+    loop_interval_sec: int = 0
 
     def __post_init__(self):
         if self.depot_downloader_extra_args is None:
             self.depot_downloader_extra_args = ["-remember-password", "-all-platforms"]
+
+    @classmethod
+    def from_strategies(cls, config_path: Optional[str] = None, **cli_args) -> "BackupConfig":
+        """
+        Load configuration with precedence:
+        1. CLI Arguments (passed as kwargs, non-None)
+        2. Environment Variables
+        3. Config File (TOML)
+        4. Defaults (class attributes)
+        """
+        # 1. Defaults (depot_downloader_extra_args uses None as its field default and
+        # is populated by __post_init__, so including None here is intentional)
+        config_data = {
+            f.name: f.default
+            for f in fields(cls)
+            if f.default is not MISSING
+        }
+        
+        # 2. Config File
+        toml_data = {}
+        target_path = config_path
+        if not target_path:
+            # Try default locations
+            if os.path.exists("config.toml"):
+                target_path = "config.toml"
+            elif os.path.exists(os.path.join(os.path.dirname(__file__), "config.toml")):
+                target_path = os.path.join(os.path.dirname(__file__), "config.toml")
+        
+        if target_path and os.path.exists(target_path):
+            toml_data = _load_toml_file(target_path)
+            # Filter unknown keys to avoid TypeError
+            valid_keys = {f.name for f in fields(cls)}
+            toml_data = {k: v for k, v in toml_data.items() if k in valid_keys}
+            config_data.update(toml_data)
+
+        # 3. Environment Variables
+        env_map = {
+            "WORK_DIR": "work_dir",
+            "MANIFEST_API_URL": "manifest_api_url",
+            "LIST_API_URL": "list_api_url",
+            "API_TIMEOUT": "api_timeout",
+            "VERIFY_SSL": "verify_ssl",
+            "USER_AGENT": "user_agent",
+            "DEPOT_DOWNLOADER_CMD": "depot_downloader_cmd",
+            "BORG_CMD": "borg_cmd",
+            "STEAM_USERNAME": "steam_username",
+            "STEAM_PASSWORD": "steam_password",
+            "DRY_RUN": "dry_run",
+            "API_RETRIES": "api_retries",
+            "RETRY_BACKOFF": "retry_backoff_sec",
+            "LOOP_INTERVAL": "loop_interval_sec",
+        }
+        
+        for env_key, field_name in env_map.items():
+            val = os.environ.get(env_key)
+            if val is not None:
+                converter = _ENV_CONVERTERS.get(field_name)
+                if converter is not None:
+                    try:
+                        config_data[field_name] = converter(val)
+                    except (ValueError, TypeError):
+                        pass
+                else:
+                    config_data[field_name] = val
+
+        # 4. CLI Arguments (Overrides)
+        for k, v in cli_args.items():
+            if v is not None:
+                config_data[k] = v
+
+        return cls(**config_data)
 
 
 def parse_iso_datetime(s: str) -> datetime:
@@ -81,6 +179,33 @@ def borg_timestamp(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def normalize_pairs(payload: Any) -> List[Dict[str, str]]:
+    """Normalize API response into a list of {appid, depot_id} dicts."""
+    if isinstance(payload, list):
+        raw = payload
+    elif isinstance(payload, dict):
+        if "data" in payload and isinstance(payload["data"], list):
+            raw = payload["data"]
+        elif "pairs" in payload and isinstance(payload["pairs"], list):
+            raw = payload["pairs"]
+        else:
+            raw = []
+    else:
+        raw = []
+
+    out: List[Dict[str, str]] = []
+    for it in raw:
+        try:
+            appid = str(it.get("appid") or it.get("app_id") or it.get("app"))
+            depot_id = str(it.get("depot_id") or it.get("depot"))
+        except Exception:
+            continue
+        if not appid or not depot_id or appid == "None" or depot_id == "None":
+            continue
+        out.append({"appid": appid, "depot_id": depot_id})
+    return out
+
+
 class SteamBorgBackup:
     def __init__(self, config: BackupConfig):
         self.cfg = config
@@ -92,7 +217,7 @@ class SteamBorgBackup:
         if self._log_buffering:
             self._log_buffer.append(line)
         else:
-            print(line)
+            print(line, flush=True)
 
     def _start_buffering_logs(self) -> None:
         self._log_buffer = []
@@ -108,22 +233,17 @@ class SteamBorgBackup:
         self._log_buffer.clear()
 
     def run_cmd(self, args: List[str], cwd: Optional[Path] = None, capture_output: bool = False):
-        self.log(f"RUN: {' '.join(args)} (cwd={cwd})")
+        print(f"[steam-borg] RUN: {' '.join(args)} (cwd={cwd})", flush=True)
         if self.cfg.dry_run:
             self.log("DRY-RUN: skipping execution")
-            class _CP:
-                def __init__(self):
-                    self.args = args
-                    self.returncode = 0
-                    self.stdout = ""
-                    self.stderr = ""
-            return _CP()
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
         return subprocess.run(
             args,
             cwd=str(cwd) if cwd else None,
             check=True,
             text=True,
             capture_output=capture_output,
+            stdin=subprocess.DEVNULL if capture_output else None,
         )
 
     def build_manifest_url(self, base_url: str, appid: str, depot_id: str) -> str:
@@ -191,7 +311,7 @@ class SteamBorgBackup:
                     with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
                         data = resp.read()
                 elif parsed.scheme == "file":
-                    path = Path(urllib.request.url2pathname(parsed.path))
+                    path = Path(parsed.path)
                     with open(path, "rb") as f:
                         data = f.read()
                 else:
@@ -224,6 +344,13 @@ class SteamBorgBackup:
         self.log(f"Fetched {len(manifests)} manifests (sorted by seen_date ascending).")
         return manifests
 
+    def fetch_pairs(self, url: str) -> List[Dict[str, str]]:
+        self.log(f"Fetching backup pairs list: {url}")
+        payload = self._read_json_from_url(url.strip(), timeout=self.cfg.api_timeout, verify_ssl=self.cfg.verify_ssl)
+        pairs = normalize_pairs(payload)
+        self.log(f"Fetched {len(pairs)} appid/depot_id pairs.")
+        return pairs
+
     def ensure_repo_dir(self, appid: str, depot_id: str) -> Path:
         root = Path(self.cfg.work_dir)
         root.mkdir(parents=True, exist_ok=True)
@@ -239,48 +366,47 @@ class SteamBorgBackup:
         else:
             self.log("Borg repo exists (.borg)")
 
+    def _parse_borg_json(self, stdout: str) -> List[Dict]:
+        payload = json.loads(stdout)
+        return [
+            {"name": str(a.get("name")), "time": parse_iso_datetime(str(a.get("time")))}
+            for a in payload.get("archives", [])
+        ]
+
+    def _parse_borg_plain(self, stdout: str) -> List[Dict]:
+        pat = re.compile(r"^(?P<name>\S+)\s+(?P<date>\w{3},\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
+        result = []
+        for ln in stdout.splitlines():
+            m = pat.match(ln.strip())
+            if not m:
+                continue
+            try:
+                dt = datetime.strptime(m.group("date"), "%a, %Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            except Exception:
+                dt = datetime.now(timezone.utc)
+            result.append({"name": m.group("name"), "time": dt})
+        return result
+
     def list_borg_archives(self, repo_dir: Path) -> List[Dict]:
         if self.cfg.dry_run:
             self.log("DRY-RUN: list archives returns empty")
             return []
+        parse_mode = "JSON"
         try:
             cp = self.run_cmd([self.cfg.borg_cmd, "list", ".borg", "--json"], cwd=repo_dir, capture_output=True)
-            payload = json.loads(cp.stdout)
-            archives = payload.get("archives", [])
-            norm_archives = []
-            for a in archives:
-                name = str(a.get("name"))
-                time_str = str(a.get("time"))
-                dt = parse_iso_datetime(time_str)
-                norm_archives.append({"name": name, "time": dt})
-            norm_archives.sort(key=lambda x: x["time"])  # ascending
-            self.log(f"Found {len(norm_archives)} borg archives (JSON).")
-            return norm_archives
+            norm_archives = self._parse_borg_json(cp.stdout)
         except Exception as e:
             self.log(f"borg list --json failed ({e}); trying plain output.")
-
-        try:
-            cp2 = self.run_cmd([self.cfg.borg_cmd, "list", ".borg"], cwd=repo_dir, capture_output=True)
-            lines = cp2.stdout.splitlines()
-            norm_archives = []
-            pat = re.compile(r"^(?P<name>\S+)\s+(?P<date>\w{3},\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
-            for ln in lines:
-                m = pat.match(ln.strip())
-                if not m:
-                    continue
-                name = m.group("name")
-                date_str = m.group("date")
-                try:
-                    dt = datetime.strptime(date_str, "%a, %Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                except Exception:
-                    dt = datetime.now(timezone.utc)
-                norm_archives.append({"name": name, "time": dt})
-            norm_archives.sort(key=lambda x: x["time"])  # ascending
-            self.log(f"Found {len(norm_archives)} borg archives (plain parse).")
-            return norm_archives
-        except Exception as e:
-            self.log(f"borg list plain failed ({e}); treating as no archives.")
-            return []
+            parse_mode = "plain"
+            try:
+                cp2 = self.run_cmd([self.cfg.borg_cmd, "list", ".borg"], cwd=repo_dir, capture_output=True)
+                norm_archives = self._parse_borg_plain(cp2.stdout)
+            except Exception as e2:
+                self.log(f"borg list plain failed ({e2}); treating as no archives.")
+                return []
+        norm_archives.sort(key=lambda x: x["time"])
+        self.log(f"Found {len(norm_archives)} borg archives ({parse_mode}).")
+        return norm_archives
 
     def extract_borg_archive(self, repo_dir: Path, archive_name: str) -> None:
         self.log(f"Extracting latest archive: {archive_name}")
@@ -320,7 +446,7 @@ class SteamBorgBackup:
         self.run_cmd(args, cwd=repo_dir)
 
     def ensure_clean_repo_tree(self, repo_dir: Path) -> None:
-        for p in repo_dir.iterdir():
+        for p in list(repo_dir.iterdir()):
             if p.name == ".borg":
                 continue
             if p.is_dir():

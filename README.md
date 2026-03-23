@@ -1,145 +1,205 @@
-# SteamDepotBackup
+# Steam Borg Backup
 
-> 注：这是一个 vibe coding 项目
+自动将 Steam Depot 历史版本下载并归档至 [BorgBackup](https://www.borgbackup.org/) 仓库，支持单次备份与批量轮询两种模式。
 
-## 项目概述
+## 依赖
 
-本项目提供了一套自动化的 Steam 应用历史版本（Depot）增量备份解决方案。通过结合 `DepotDownloader` 的下载能力与 `BorgBackup` 的去重存储特性，本工具能够高效地下载指定 AppID 和 DepotID 的历史 Manifest 版本，并将其存储在去重仓库中。
+| 工具 | 说明 |
+|---|---|
+| Python 3.11+ | `tomllib` 为内置模块（3.11 以下需安装 `tomli`） |
+| [DepotDownloader](https://github.com/SteamRE/DepotDownloader) | 从 Steam 下载指定 Manifest |
+| [BorgBackup](https://www.borgbackup.org/) | 增量去重归档 |
+| Manifest API | 自托管接口，返回指定 appid/depot 的 manifest 列表 |
 
-核心功能包括：
-
-- **自动化清单获取**：从指定 API 接口获取应用的历史 Manifest 列表。
-- **增量去重存储**：利用 BorgBackup 技术，仅存储版本间变更的数据块，极大节省存储空间。
-- **智能流程编排**：自动处理仓库初始化、历史版本提取、差异下载及归档创建。
-- **批量任务处理**：支持通过接口或文件列表批量执行多个应用的备份任务。
-
-## 安装指南
-
-### 1. 环境要求
-
-运行本项目需要以下基础环境：
-
-- **操作系统**：Windows (WSL2 推荐) / Linux / macOS
-- **Python**：3.7 或更高版本
-- **.NET Runtime**：用于运行 DepotDownloader
-
-### 2. 依赖工具
-
-请确保以下工具已安装并配置在系统环境变量中，或在运行时指定路径：
-
-- **BorgBackup**：用于创建去重备份仓库。
-  - [官方文档](https://borgbackup.readthedocs.io/)
-- **DepotDownloader**：用于从 Steam 服务器下载指定版本的 Depot 文件。
-  - [GitHub 仓库](https://github.com/SteamRE/DepotDownloader)
-
-### 3. 项目部署
-
-克隆代码仓库到本地目录：
+## 快速开始
 
 ```bash
-git clone <repository_url>
-cd steam_borg_backup
+# 1. 复制并填写配置文件
+cp config.example.toml config.toml
+
+# 2. 单次备份一个 Depot
+python steam_borg_backup.py --appid 440 --depot 441
+
+# 3. 批量备份（从接口拉取列表，单次运行）
+python run_batch_backups.py --list-api https://your-host/webhook/steam_appid_depot_id
+
+# 4. 批量备份（持续轮询，每 60 秒一轮）
+python run_batch_backups.py --list-api https://your-host/webhook/steam_appid_depot_id --interval 60
 ```
 
-本项目主要依赖 Python 标准库，无需安装额外的 `pip` 包。
+## 配置优先级
 
-## 使用说明
+配置来源按以下优先级叠加（高优先级覆盖低优先级）：
 
-本项目包含两个主要执行脚本，分别用于单任务备份和批量任务备份。
+```
+CLI 参数 > 环境变量 > config.toml > 默认值
+```
 
-### 单任务备份
+### config.toml 主要字段
 
-使用 `steam_borg_backup.py` 对指定的单个 AppID 和 DepotID 进行备份。
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `work_dir` | `/mnt/z/depots/data` | 备份根目录 |
+| `manifest_api_url` | — | Manifest 列表接口 URL |
+| `list_api_url` | — | 批量任务列表接口 URL |
+| `depot_downloader_cmd` | `DepotDownloader` | 可执行文件路径或命令名 |
+| `borg_cmd` | `borg` | 可执行文件路径或命令名 |
+| `steam_username` | — | Steam 用户名 |
+| `steam_password` | — | Steam 密码（可选） |
+| `api_timeout` | `15` | 接口超时秒数 |
+| `api_retries` | `3` | 超时重试次数 |
+| `retry_backoff_sec` | `2.0` | 指数退避基础间隔（秒） |
+| `verify_ssl` | `true` | 是否验证 SSL 证书 |
+| `dry_run` | `false` | 仅打印命令，不执行 |
+| `loop_interval_sec` | `0` | 批量轮询间隔（0 = 单次） |
 
-**基本命令格式：**
+等价环境变量：`WORK_DIR`、`MANIFEST_API_URL`、`LIST_API_URL`、`STEAM_USERNAME`、`STEAM_PASSWORD`、`DRY_RUN`、`LOOP_INTERVAL` 等。
+
+## 工作目录结构
+
+```
+work_dir/
+└── {appid}_{depot_id}/          # 每个 Depot 独立目录
+    ├── .borg/                   # Borg 仓库（无加密）
+    │   ├── config
+    │   └── data/
+    └── （临时文件，备份完成后自动清理）
+```
+
+每个 Manifest 以其 `manifest_id` 作为 Borg 归档名，时间戳取自 API 返回的 `seen_date`。
+
+## 架构图
+
+```mermaid
+flowchart TD
+    subgraph CLI["命令行入口"]
+        A["steam_borg_backup.py\n单次备份"]
+        B["run_batch_backups.py\n批量 / 轮询备份"]
+    end
+
+    subgraph Config["配置加载 BackupConfig.from_strategies()"]
+        C1["CLI 参数"]
+        C2["环境变量"]
+        C3["config.toml"]
+        C4["默认值"]
+        C1 --> CM["BackupConfig"]
+        C2 --> CM
+        C3 --> CM
+        C4 --> CM
+    end
+
+    subgraph Core["核心逻辑 SteamBorgBackup"]
+        D["orchestrate_backup(appid, depot_id)"]
+        D --> D1["ensure_repo_dir()\n创建工作目录"]
+        D1 --> D2["ensure_borg_repo()\n初始化 .borg 仓库"]
+        D2 --> D3["fetch_manifests()\n拉取 Manifest 列表 API"]
+        D3 --> D4["list_borg_archives()\n查询已归档的 Manifest"]
+        D4 --> D5{{"有新 Manifest?"}}
+        D5 -- 是 --> D6["extract_borg_archive()\n还原最新存档（增量基底）"]
+        D6 --> D7["depot_download_manifest()\nDepotDownloader 下载"]
+        D7 --> D8["borg_create_archive()\n创建新归档"]
+        D8 --> D5
+        D5 -- 否 --> D9["ensure_clean_repo_tree()\n清理临时文件"]
+    end
+
+    subgraph External["外部组件"]
+        E1["Manifest API\n(HTTP/HTTPS/file)"]
+        E2["List API\n(批量任务列表)"]
+        E3["DepotDownloader\n(Steam 内容下载)"]
+        E4["BorgBackup\n(增量去重归档)"]
+    end
+
+    A --> Config
+    B --> Config
+    Config --> Core
+
+    B -- "fetch_pairs()" --> E2
+
+    D3 -- "HTTP GET" --> E1
+    D7 -- "subprocess" --> E3
+    D2 & D4 & D6 & D8 & D9 -- "subprocess" --> E4
+
+    style CLI fill:#dbeafe,stroke:#3b82f6
+    style Config fill:#fef9c3,stroke:#eab308
+    style Core fill:#dcfce7,stroke:#22c55e
+    style External fill:#f3e8ff,stroke:#a855f7
+```
+
+## Borg 仓库说明
+
+### 压缩
+
+Borg 默认使用 **lz4** 压缩（高速、低 CPU 占用）。本项目使用 `--encryption=none` 初始化仓库，不加密，适合本地受控存储场景。
+
+如需更高压缩率，可在 `borg create` 时手动加 `--compression zstd`，但需修改 `borg_create_archive()` 传参。
+
+### 去重机制
+
+Borg 以内容定义的**可变长分块（CDC）**进行去重：不同 Manifest 之间相同的文件块只存储一次，多个版本共享数据块，空间利用率远高于全量备份。
+
+### 归档命名规则
+
+每个归档以 `manifest_id` 命名，时间戳取自 API 的 `seen_date`：
+
+```
+.borg::1234567890123456789   ←  manifest_id
+          timestamp = seen_date（UTC）
+```
+
+> 修改归档命名规则会导致已有归档无法被识别为"已备份"，触发重复下载。
+
+### 仓库迁移
+
+若 `work_dir` 路径发生变更（如本项目从 `/mnt/z/depots/` 迁移至 `/mnt/z/depots/data/`），Borg 首次访问时会弹出路径变更确认。运行时通过环境变量自动处理：
+
+```
+BORG_RELOCATED_REPO_ACCESS_POLICY=allow
+```
+
+### 崩溃恢复
+
+若备份中途中断（Ctrl+C、系统崩溃），Borg 可能遗留锁文件，下次运行会超时报错。手动解锁：
 
 ```bash
-python steam_borg_backup.py --appid <APPID> --depot <DEPOT_ID> [参数]
+cd /mnt/z/depots/data/{appid}_{depot_id}
+borg break-lock .borg
 ```
 
-**示例：**
+---
 
-```bash
-python steam_borg_backup.py \
-    --appid 4075460 \
-    --depot 4075461 \
-    --work-dir /mnt/z/depots \
-    --username your_steam_user
-```
+## 文件说明
 
-### 批量任务备份
+| 文件 | 说明 |
+|---|---|
+| [borg_backup_lib.py](borg_backup_lib.py) | 核心库：`BackupConfig`、`SteamBorgBackup`、工具函数 |
+| [steam_borg_backup.py](steam_borg_backup.py) | 单次备份 CLI 入口 |
+| [run_batch_backups.py](run_batch_backups.py) | 批量 / 轮询备份 CLI 入口 |
+| [config.example.toml](config.example.toml) | 配置文件模板 |
 
-使用 `run_batch_backups.py` 从接口获取任务列表并顺序执行备份。
+## Manifest API 接口格式
 
-**基本命令格式：**
-
-```bash
-python run_batch_backups.py --list-api <LIST_API_URL> [参数]
-```
-
-**示例：**
-
-```bash
-python run_batch_backups.py \
-    --list-api "http://localhost/api/backup_list" \
-    --work-dir /mnt/z/depots \
-    --username your_steam_user
-```
-
-## 配置说明
-
-本项目支持通过命令行参数或环境变量进行配置。命令行参数优先级高于环境变量。
-
-### 通用参数
-
-| 参数名 | 环境变量 | 说明 | 默认值 |
-| :--- | :--- | :--- | :--- |
-| `--work-dir` | `WORK_DIR` | 备份数据存储的工作目录 | `/mnt/z/depots` |
-| `--api-url` | `MANIFEST_API_URL` | Manifest 列表查询接口 URL | (内置默认地址) |
-| `--downloader` | `DEPOT_DOWNLOADER_CMD` | DepotDownloader 可执行文件路径 | `DepotDownloader` |
-| `--borg` | `BORG_CMD` | BorgBackup 可执行文件路径 | `borg` |
-| `--username` | `STEAM_USERNAME` | Steam 账户用户名 | `sliots` |
-| `--password` | `STEAM_PASSWORD` | Steam 账户密码 (可选) | 无 |
-| `--timeout` | `API_TIMEOUT` | API 请求超时时间 (秒) | 15 |
-| `--dry-run` | `DRY_RUN` | 仅输出流程日志，不执行实际命令 | False |
-| `--insecure` | `VERIFY_SSL` | 跳过 SSL 证书验证 | False |
-
-### 批量任务特有参数
-
-以下参数仅适用于 `run_batch_backups.py`：
-
-| 参数名 | 说明 | 默认值 |
-| :--- | :--- | :--- |
-| `--list-api` | **(必填)** 获取备份任务列表的 API 地址或文件路径 | 无 |
-| `--api-retries` | 接口请求失败重试次数 | 3 |
-| `--retry-backoff` | 重试等待的基础时间间隔 (秒) | 2.0 |
-
-### 接口数据格式要求
-
-**Manifest 列表接口 (`--api-url`) 返回格式：**
+**manifest_api_url** 需返回如下 JSON：
 
 ```json
 {
   "data": [
     {
-      "manifest_id": "652381323314602403",
-      "depot_id": "4075461",
-      "seen_date": "2025-11-03T06:16:03.000Z",
-      "appid": "4075460"
+      "manifest_id": "1234567890123456789",
+      "depot_id": "441",
+      "appid": "440",
+      "seen_date": "2024-01-15T10:30:00Z"
     }
   ]
 }
 ```
 
-**批量任务列表接口 (`--list-api`) 返回格式：**
+**list_api_url**（批量模式）需返回：
 
 ```json
-{
-  "data": [
-    {
-      "appid": "4075460",
-      "depot_id": "4075461"
-    }
-  ]
-}
+[
+  { "appid": "440", "depot_id": "441" },
+  { "appid": "730", "depot_id": "731" }
+]
 ```
+
+也支持 `{ "data": [...] }` 或 `{ "pairs": [...] }` 的包裹格式，字段名兼容 `app_id` / `app`、`depot` 等变体。

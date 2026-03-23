@@ -1,0 +1,31 @@
+# Steam Borg Backup Configuration — copy to config.toml and fill in your values
+
+# Working directory where backups will be stored
+work_dir = "/mnt/z/depots/data"
+
+# API to fetch manifest details for a specific app/depot
+manifest_api_url = "https://your-host/webhook/steamdb_manifest"
+
+# API to fetch the list of apps/depots to backup (for batch mode)
+list_api_url = "https://your-host/webhook/steam_appid_depot_id"
+
+# Command paths
+depot_downloader_cmd = "DepotDownloader"
+borg_cmd = "borg"
+
+# Steam credentials
+steam_username = "your_steam_username"
+# steam_password = "your_steam_password"
+
+# Network settings
+api_timeout = 15
+verify_ssl = true
+user_agent = "steam-borg-backup/1.0"
+api_retries = 3
+retry_backoff_sec = 2.0
+
+# Operation settings
+dry_run = false
+
+# Loop interval in seconds (0 = single run, >0 = repeat every N seconds)
+loop_interval_sec = 60
